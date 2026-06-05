@@ -10,6 +10,7 @@ WORKDIR /work
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
+    xauth \
     chromium \
     ca-certificates \
     curl \
