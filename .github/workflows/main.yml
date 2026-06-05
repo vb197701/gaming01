@@ -1,0 +1,137 @@
+name: Auto Run
+
+on:
+  schedule:
+    - cron: '6 7,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: auto-run-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-addtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 📥 Checkout 当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📥 Checkout 私库脚本
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制私库脚本到当前仓库工作目录
+        run: |
+          cp private/main.py main.py
+          ls -lah
+
+      - name: 🌐 安装并配置 Cloudflare WARP CLI
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode warp
+          warp-cli --accept-tos connect
+
+          sleep 5
+          warp-cli --accept-tos status || true
+
+      - name: 🔑 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📥 拉取运行镜像
+        run: |
+          docker pull ghcr.io/${{ github.repository_owner }}/game-re1-runner:py311-xvfb-latest
+
+      - name: ▶️ 在容器中运行续期脚本
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -o pipefail
+          docker run --rm \
+            --network host \
+            -e TELEGRAM_BOT_TOKEN \
+            -e TELEGRAM_CHAT_ID \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            ghcr.io/${{ github.repository_owner }}/game-re1-runner:py311-xvfb-latest \
+            bash -lc 'xvfb-run -a python main.py' | tee run.log
+
+      - name: 📄 检查结果文件
+        if: always()
+        run: |
+          echo "==== 当前目录文件 ===="
+          ls -lah
+          echo "==== runtime_state.json ===="
+          cat runtime_state.json || true
+          echo "==== run.log 最后 100 行 ===="
+          tail -n 100 run.log || true
+
+      - name: 🗂️ 回写 runtime_state.json 到当前仓库
+        if: always()
+        run: |
+          if [ ! -f runtime_state.json ]; then
+            echo "runtime_state.json 不存在，跳过提交"
+            exit 0
+          fi
+
+          mkdir -p state
+          cp runtime_state.json state/runtime_state.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state/runtime_state.json
+
+          if git diff --cached --quiet; then
+            echo "state/runtime_state.json 无变化，无需提交"
+            exit 0
+          fi
+
+          git commit -m "chore: update runtime state"
+          git push
+
+      - name: 📤 上传运行结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-state-${{ github.run_number }}
+          retention-days: 15
+          path: |
+            runtime_state.json
+            state/runtime_state.json
+            run.log
+          if-no-files-found: warn
+
+      - name: 📤 上传调试文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-files-${{ github.run_number }}
+          retention-days: 7
+          path: |
+            debug/**
+          if-no-files-found: ignore
